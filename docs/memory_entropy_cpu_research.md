@@ -112,6 +112,27 @@ Gaussian NLL/entropy/KL 및 앙상블 CRPS 함수를 제공한다. 기존 main�
 자유 예보에서 memory의 innovation이 자신의 주입 노이즈를 관측 오차로 잘못 읽지 않도록
 `core.fc`를 실제 반환된 멤버 상태와 일치시켜야 한다.
 
+### 요청 보완: entropy를 실제 입력으로 연결하는 추가 비교
+
+`EntropyConditionedMemoryCore`와 합성계의 `EntropyInputClosure`를 추가했다.
+먼저 현재 X/G와 잠정 기억으로 조건부 Gaussian σ를 계산하고,
+`e = ∫p log p − ∫pref log pref = −log(σ/σref)`를 계산해 기억의 학습 가능한
+보정 입력으로 넣은 뒤 경향을 적분한다. σ는 같은 시각에 보정된 기억을 다시 읽지 않아 순환식이 없다.
+기준 σ는 고정된 정규화 단위이며 미래 test 자료로 정하지 않는다.
+
+`memory_entropy_off/on`은 같은 구조·매개변수·초기 가중치·배치로 학습하며 off는 e만 0이다.
+`memory_entropy_mean`은 on과 같은 조건부 분포를 학습하되 자유 예보에서 샘플링만 끈 경로다.
+비선형 모델의 샘플링을 끈 경로는 앙상블 평균과 다르다.
+학습된 on 모델에서 가중치는 그대로 두고 entropy 입력만 끄는 개입도 기록한다.
+Gaussian에서는 이 entropy가 log-scale의 다른 표현이므로 독립적인 정보나 물리 법칙의 검증은 아니다.
+초기 entropy 보정과 σ head가 모두 0 변화에서 시작하므로, σ를 NLL/CRPS로 학습해야 한다.
+기존 결정론 MSE 학습기에 adapter만 붙였다고 entropy 경로가 자동으로 학습되는 것은 아니다.
+
+```bash
+EXECUTION_LABEL='실제 실행 위치' PYTHON_BIN=.venv-cpu/bin/python \
+  OUTDIR=runs/memory_entropy_direct_cpu bash scripts/run_memory_entropy_cloud_cpu.sh entropy
+```
+
 수분 양성·질량 사영 뒤의 분포는 Gaussian이 아니다. analytic NLL/entropy는 **사영 전 법칙**의
 값이며, 사영된 최종 멤버의 분포 성능은 CRPS 등 샘플 기반 점수로 평가한다.
 현재 adapter는 전구 보존형 노이즈를 구현하지 않는다. `PositiveMass(ref=None)`가 보존하는 것은

@@ -201,3 +201,145 @@ class StochasticMemoryCore(nn.Module):
                           stochastic=stochastic, generator=generator)
             out.append(x)
         return torch.stack(out, 1)
+
+
+class EntropyConditionedMemoryCore(StochasticMemoryCore):
+    """Feed centered negative Gaussian entropy directly into causal memory.
+
+    ``core`` must be an existing ``make_core(mem>0, norm='gn', ...)`` memory
+    core, with ``remember`` and ``_advance`` as well as ``mem_ch``. For the
+    dimensionless increment eta=(X_next-location)/core.t6, the conditional
+    pre-projection diagonal Gaussian has standard deviation ``s``. Its input is
+
+        e = integral p log(p) - integral p_ref log(p_ref) = -log(s / s_ref).
+
+    This is centered negative *differential* entropy per active channel. It is
+    neither KL nor thermodynamic entropy. A zero-initialized bias-free 1x1 map
+    adds e to the GRU memory. Setting ``entropy_enabled=False`` supplies e=0 to
+    the same architecture and parameter count; a fresh zero map reproduces the
+    original deterministic dynamics. There is no assumed benefit from this
+    feature, since e is itself a function of the learned conditional scale.
+
+    One day is acyclic: remember x -> sigma(x,G,m) -> e -> augmented m ->
+    deterministic _advance -> optional noise -> finish. Sigma never reads the
+    current entropy-augmented memory or the next observed weather state. Reset
+    replays these same deterministic entropy-conditioned steps on observed
+    *past* states and stores their forecasts in ``core.seq`` for an MZ loss.
+
+    ``step``/``rollout`` retain the parent API, including HOURS for hours0, and
+    the same pre-projection density, forcing, and conservation limitations.
+    ``last_entropy_input`` and ``last_relative_scale`` expose the latest causal
+    input; ``seq`` exposes warm-up forecasts. The noise is white in time.
+    """
+
+    def __init__(self, core: nn.Module, *, reference_relative_scale=0.1,
+                 entropy_enabled=True, initial_scale=0.1, scale_floor=1e-4,
+                 step_hours=24.0):
+        if not getattr(core, "mem", 0) or not hasattr(core, "remember") or not hasattr(core, "_advance"):
+            raise ValueError("entropy conditioning requires an existing causal memory core")
+        super().__init__(core, initial_scale=initial_scale, scale_floor=scale_floor, step_hours=step_hours)
+        reference = _floating(reference_relative_scale, core.t6)
+        if not bool(torch.isfinite(reference).all()) or not bool((reference > 0).all()):
+            raise ValueError("reference_relative_scale must be finite and positive")
+        if reference.ndim == 1:
+            reference = reference.view(1, -1, 1, 1)
+        try:
+            reference_shape = torch.broadcast_shapes(reference.shape, core.t6.shape)
+        except RuntimeError as exc:
+            raise ValueError("reference_relative_scale must broadcast over the core channels") from exc
+        if reference_shape != core.t6.shape:
+            raise ValueError("reference_relative_scale must be scalar or fixed per core channel")
+        self.register_buffer("reference_relative_scale", reference.clone())
+        self.entropy_enabled = bool(entropy_enabled)
+        self.entropy_to_memory = nn.Conv2d(core.t6.shape[1], core.mem_ch, 1, bias=False)
+        self.entropy_to_memory.to(device=core.t6.device, dtype=core.t6.dtype)
+        nn.init.zeros_(self.entropy_to_memory.weight)
+        self.last_entropy_input, self.last_relative_scale = None, None
+
+    @property
+    def mem(self):
+        return self.core.mem
+
+    @property
+    def mz(self):
+        return getattr(self.core, "mz", False)
+
+    @property
+    def seq(self):
+        return self.core.seq
+
+    @property
+    def stride(self):
+        return getattr(self.core, "stride", 1)
+
+    def entropy_feature(self, relative_scale):
+        """Centered integral p log p, masked to predicted channels (or zero)."""
+        relative_scale = _floating(relative_scale, self.core.t6)
+        if not bool(torch.isfinite(relative_scale).all()) or not bool((relative_scale > 0).all()):
+            raise ValueError("relative_scale must be finite and positive")
+        if not self.entropy_enabled:
+            return torch.zeros_like(relative_scale) * self.core.keep
+        return -(relative_scale.log() - self.reference_relative_scale.log()) * self.core.keep
+
+    def reset(self, history=None, hours0=None, x0=None):
+        """Replay only observed history, deterministically, with this adapter.
+
+        ``history`` is (B,W,C,H,W), oldest first. ``hours0`` is the IC time and
+        is required when W>0. ``x0`` supplies only the final warm-up forecast's
+        known forcing channel. Its other channels cannot enter that forecast.
+        """
+        self.core.reset(None)
+        self.last_entropy_input, self.last_relative_scale = None, None
+        if history is None or history.shape[1] == 0:
+            return
+        if hours0 is None:
+            raise ValueError("hours0 is required for causal history replay")
+        hours0 = _floating(hours0, history)
+        count = history.shape[1]
+        inactive = torch.nonzero(self.core.keep.reshape(-1) == 0, as_tuple=False).flatten()
+        if inactive.numel() > 1:
+            raise ValueError("history replay supports at most one known forcing channel")
+        forcing_index = int(inactive[0]) if inactive.numel() else None
+        forecasts = []
+        freeze = getattr(self.core, "freeze_mem", False)
+        self.core.freeze_mem = False  # observed warm-up always updates memory
+        try:
+            for k in range(count):
+                next_observed = history[:, k + 1] if k + 1 < count else x0
+                forcing = (None if next_observed is None or forcing_index is None
+                           else next_observed[:, forcing_index])
+                # Preserve MemCore.reset's daily warm-up clock exactly. Its
+                # optional forecast stride is applied after the IC by rollout.
+                hours = hours0 - (count - k) * self.step_hours
+                forecasts.append(self.step(history[:, k], hours, forcing, stochastic=False))
+        finally:
+            self.core.freeze_mem = freeze
+        self.core.seq = torch.stack(forecasts, 1)
+        # Match the original reset: freeze_mem begins at the first forecast IC,
+        # not during the observed history used to initialize its memory.
+        self.core.started = False
+
+    def step(self, x, hours, tisr_next=None, *, stochastic=True,
+             generator: Optional[torch.Generator] = None, return_distribution=False):
+        update_memory = not (getattr(self.core, "freeze_mem", False) and getattr(self.core, "started", False))
+        if update_memory:
+            self.core.remember(x)
+        # Sigma reads current x/G and the memory BEFORE the current entropy
+        # injection; this order avoids an algebraic sigma <-> entropy loop.
+        hidden = self.core._trunk(x, hours)
+        raw_relative = F.softplus(self.noise_head(hidden)) + self.scale_floor
+        absolute = (raw_relative * self.core.t6).clamp_min(1e-6)
+        relative = absolute / self.core.t6
+        entropy = self.entropy_feature(relative)
+        self.last_entropy_input, self.last_relative_scale = entropy, relative
+        if update_memory:
+            self.core.m = self.core.m + self.entropy_to_memory(entropy)
+        self.core.started = True
+        location = self.core._advance(x, hours, tisr_next)
+        scale = absolute * self.core.keep
+        sample = location
+        if stochastic:
+            noise = torch.randn(x.shape, dtype=x.dtype, device=x.device, generator=generator)
+            sample = self.core.finish(location + scale * noise, tisr_next)
+        self.core.fc = sample
+        return (sample, location, scale) if return_distribution else sample

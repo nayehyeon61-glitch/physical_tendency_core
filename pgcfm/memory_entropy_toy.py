@@ -77,6 +77,27 @@ ARMS = {
     "memory_colored_kl": (True, True, True),
 }
 
+# These are an explicit paired experiment. They do not change the original
+# arms above or their defaults, so earlier study results remain reproducible.
+ENTROPY_INPUT_ARMS = ("memory_entropy_off", "memory_entropy_on", "memory_entropy_mean")
+
+
+def centered_negative_entropy(scale, reference_scale):
+    """Gaussian ∫p log p - ∫p_ref log p_ref = -log(sigma/sigma_ref).
+
+    Both densities refer to the same dimensionless increment coordinate. For
+    this toy the increment normalization is the train-only reference_scale,
+    so its reference relative sigma is one. The ratio also equals the ratio
+    of displacement sigmas in the original x coordinate. This feature is
+    simply conditional log scale, not independent information or a claim of
+    thermodynamic entropy / a noise-entropy duality.
+    """
+    reference = torch.as_tensor(reference_scale, device=scale.device, dtype=scale.dtype)
+    if not bool(torch.isfinite(scale).all() and (scale > 0).all()
+                and torch.isfinite(reference).all() and (reference > 0).all()):
+        raise ValueError("Gaussian entropy scales must be finite and positive")
+    return -torch.log(scale / reference)
+
 
 class PhysicalClosure(nn.Module):
     """G(x) plus a learned closure, optionally with recurrent observed history.
@@ -173,7 +194,9 @@ class PhysicalClosure(nn.Module):
             mean = mean[:, 0]
             if self.stochastic:
                 scale = scale[:, 0]
-                eps = torch.randn(mean.shape, generator=rng, device=mean.device, dtype=mean.dtype)
+                # Only the paired entropy_mean arm sets sample_forecasts=False.
+                eps = (torch.randn(mean.shape, generator=rng, device=mean.device, dtype=mean.dtype)
+                       if getattr(self, "sample_forecasts", True) else torch.zeros_like(mean))
                 if self.colored:
                     z = self.rho * previous_z + torch.sqrt(1 - self.rho ** 2) * eps
                     conditional_scale = scale * torch.sqrt(1 - self.rho ** 2)
@@ -187,6 +210,69 @@ class PhysicalClosure(nn.Module):
             paths.append(x_next.reshape(members, B))
             x = x_next[:, None]
         return torch.stack(paths, -1), (torch.stack(entropies, -1) if entropies else None)
+
+
+class EntropyInputClosure(PhysicalClosure):
+    """Capacity-matched direct-input test of a Gaussian entropy feature.
+
+    For every observed/current x_t, update provisional memory m0_t, calculate
+    sigma_t on m0_t, form e_t=-log(sigma_t/reference_scale), and inject a learned
+    zero-initialized linear residual into memory before calculating the drift:
+
+        m0_t = GRU([x_t,G(x_t)], m_(t-1))
+        sigma_t = scale_head(x_t,G(x_t),m0_t)
+        m_t = m0_t + A e_t
+        mean_t = x_t + dt*(G(x_t)+closure(x_t,G(x_t),m_t)).
+
+    The next step carries m_t. There is no same-step sigma/drift algebraic
+    loop. Off uses e_t=0 with identical parameters, code path and optimizer
+    budget. Mean trains the identical stochastic law as On but evaluates its
+    sampling-off mean path; a nonlinear mean path is not an ensemble mean.
+    """
+
+    def __init__(self, arm: str, dt: float, reference_scale: float, width: int = 16):
+        if arm not in ENTROPY_INPUT_ARMS:
+            raise ValueError(arm)
+        # All three arms construct EXACTLY the same modules in the same order.
+        super().__init__("memory_white", dt, reference_scale, width)
+        self.arm = arm
+        self.entropy_enabled = arm != "memory_entropy_off"
+        self.sample_forecasts = arm != "memory_entropy_mean"
+        self.entropy_to_memory = nn.Linear(1, width, bias=False)
+        nn.init.zeros_(self.entropy_to_memory.weight)
+        self.last_entropy_input = None
+        self.last_raw_entropy_input = None
+
+    def parameters_at(self, x, hidden=None):
+        if x.ndim != 2 or x.shape[1] < 1:
+            raise ValueError("x must have shape (batch, nonempty time)")
+        means, scales, inputs, raw_inputs = [], [], [], []
+        for t in range(x.shape[1]):
+            current = x[:, t]
+            features = torch.stack((current, physical_tendency(current)), dim=-1)
+            _, provisional = self.gru(features[:, None], hidden)
+            z = self.trunk(torch.cat((features, provisional[0]), dim=-1))
+            scale = self.reference_scale * torch.exp(self.scale_head(z).squeeze(-1).clamp(-4, 3))
+            raw_e = centered_negative_entropy(scale, self.reference_scale)
+            e = raw_e if self.entropy_enabled else torch.zeros_like(raw_e)
+            memory = provisional[0] + self.entropy_to_memory(e[:, None])
+            hidden = memory[None]
+            z_mean = self.trunk(torch.cat((features, memory), dim=-1))
+            correction = 2.0 * torch.tanh(self.drift_head(z_mean).squeeze(-1))
+            means.append(current + self.dt * (physical_tendency(current) + correction))
+            scales.append(scale)
+            inputs.append(e)
+            raw_inputs.append(raw_e)
+        # Diagnostics are detached and never used as recurrence state.
+        self.last_entropy_input = torch.stack(inputs, dim=1).detach()
+        self.last_raw_entropy_input = torch.stack(raw_inputs, dim=1).detach()
+        return torch.stack(means, dim=1), torch.stack(scales, dim=1), hidden
+
+
+def make_closure(arm: str, dt: float, reference_scale: float, width: int = 16):
+    """Dispatch new direct-input arms without changing earlier arm semantics."""
+    cls = EntropyInputClosure if arm in ENTROPY_INPUT_ARMS else PhysicalClosure
+    return cls(arm, dt, reference_scale, width)
 
 
 def split_data(config: ToyConfig, n_train=128, n_validation=32, n_test=64, length=128,
@@ -286,6 +372,18 @@ def evaluate_model(model, testing, history=16, horizon=40, members=64, seed=3141
                "variance_ratio": pred_variance / max(true_variance, 1e-12),
                "mean_conditional_entropy": None if entropy is None else float(entropy.mean()),
                "rho": float(model.rho), "temporal": temporal}
+    if isinstance(model, EntropyInputClosure):
+        # observed_law just populated these diagnostics on the untouched test
+        # sequence; they are not inputs to training, warmup or future forecasts.
+        e = model.last_entropy_input
+        raw_e = model.last_raw_entropy_input
+        summary["entropy_input"] = {
+            "enabled": model.entropy_enabled,
+            "sampling_enabled": model.sample_forecasts,
+            "raw_mean": float(raw_e.mean()), "raw_std": float(raw_e.std(unbiased=False)),
+            "used_mean": float(e.mean()), "used_std": float(e.std(unbiased=False)),
+            "feedback_weight_norm": float(model.entropy_to_memory.weight.norm()),
+        }
     leads = [{"lead_step": t + 1, "lead_time": (t + 1) * model.dt,
               "rmse": float(rmse[t]), "crps": float(crps[t]),
               "coverage90": float(coverage[t]), "rms_spread": float(spread[t])}

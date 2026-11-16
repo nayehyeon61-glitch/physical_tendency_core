@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT))
 import numpy as np
 import torch
 
-from pgcfm.memory_entropy_toy import (ARMS, PhysicalClosure, ToyConfig, evaluate_model,
+from pgcfm.memory_entropy_toy import (ARMS, ENTROPY_INPUT_ARMS, ToyConfig, evaluate_model, make_closure,
                                      split_data, train_model, train_reference_scale)
 
 
@@ -31,7 +31,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path, default=ROOT / "runs/memory_entropy_cpu")
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
-    p.add_argument("--arms", choices=list(ARMS), nargs="+", default=list(ARMS)[:-1])
+    p.add_argument("--arms", choices=list(ARMS) + list(ENTROPY_INPUT_ARMS), nargs="+", default=list(ARMS)[:-1])
     p.add_argument("--include-kl", action="store_true")
     p.add_argument("--iterations", type=int, default=300)
     p.add_argument("--width", type=int, default=16)
@@ -77,7 +77,7 @@ def save_csv(path, rows):
     if not rows:
         return
     with path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w = csv.DictWriter(f, fieldnames=list(rows[0]), lineterminator="\n")
         w.writeheader()
         w.writerows(rows)
 
@@ -133,6 +133,16 @@ def main():
                   "forecast_inputs": "observed history only; hidden generator m/eta and future truth never supplied",
                   "potential": "known G = -dU/dx with U=0.4*x^2+0.025*x^4; no second potential added",
                   "entropy_regularizer": "optional same-mean Gaussian variance KL to train-only reference, beta preset; not raw entropy maximization"}
+    if any(arm in ENTROPY_INPUT_ARMS for arm in a.arms):
+        provenance["direct_entropy_input"] = {
+            "feature": "e=integral(p log p)-integral(pref log pref)=-log(sigma/reference_sigma)",
+            "density": "conditional Gaussian dimensionless next-step increment; reference relative sigma=1",
+            "reference_sigma": "training-only physical-residual displacement std",
+            "order": "provisional GRU(x,G,m) -> sigma -> e -> zero-init linear entropy-to-memory residual -> mean drift",
+            "off_control": "e=0; identical modules, parameter count, initialized weights and minibatch seeds",
+            "mean_control": "identical trained stochastic law to on; sampling off only for free rollout",
+            "interpretation": "conditional log-scale feature; no independent information or proven noise-entropy duality",
+        }
     provenance["source_sha256"] = {
         name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
         for name in ("pgcfm/memory_entropy_toy.py", "pgcfm/stochastic_memory.py",
@@ -143,13 +153,29 @@ def main():
     for seed in a.seeds:
         for arm in a.arms:
             torch.manual_seed(seed)
-            model = PhysicalClosure(arm, config.dt, ref, a.width)
+            model = make_closure(arm, config.dt, ref, a.width)
             t0 = time.perf_counter()
             fit = train_model(model, data["train"], data["validation"], seed=seed,
                               iterations=a.iterations, batch_size=a.batch_size, sequence=a.sequence,
                               warmup=a.warmup, kl_weight=a.kl_weight)
             metrics, leads, example = evaluate_model(model, data["test"], history=a.history,
                                                      horizon=a.horizon, members=a.members, seed=100000 + seed)
+            if arm == "memory_entropy_on":
+                # A paired inference intervention isolates the USED entropy
+                # feature in this same trained model, beyond off/on retraining.
+                model.entropy_enabled = False
+                try:
+                    zero_metrics, _, _ = evaluate_model(model, data["test"], history=a.history,
+                                                       horizon=a.horizon, members=a.members, seed=100000 + seed)
+                finally:
+                    model.entropy_enabled = True
+                metrics["entropy_zero_input_intervention"] = {
+                    "same_weights_and_sampling_seed": True,
+                    "mean_rollout_rmse": zero_metrics.get("mean_rollout_rmse"),
+                    "mean_rollout_crps": zero_metrics.get("mean_rollout_crps"),
+                    "one_step_nll": zero_metrics.get("one_step_nll"),
+                    "coverage90": zero_metrics.get("coverage90"),
+                }
             record = {"arm": arm, "seed": seed, "parameters": sum(p.numel() for p in model.parameters()),
                       "seconds": time.perf_counter() - t0, "fit": fit, "metrics": metrics}
             records.append(record)
@@ -178,8 +204,15 @@ def main():
                      f"{fmt(row, 'mean_rollout_crps')} | {fmt(row, 'coverage90')} |")
     lines += ["", "Same width and optimizer updates; memory adds GRU parameters. Deterministic forecasts have zero ensemble spread.",
               "Seed std is training-seed variability on shared fixed independent trajectory splits, not a confidence interval.",
-              "Entropy is diagnostic; the optional KL arm penalizes a variance ratio to a train-only reference.",
+              ("Centered negative Gaussian entropy is a direct causal memory input in the matched off/on arms; "
+               "mean uses the same learned law with sampling disabled."
+               if any(arm in ENTROPY_INPUT_ARMS for arm in a.arms) else
+               "Entropy is diagnostic; the optional KL arm penalizes a variance ratio to a train-only reference."),
               f"Execution: {a.execution_label}; CPU threads={a.threads}; elapsed={result['elapsed_seconds']:.1f} s.", ""]
+    if any(arm in ENTROPY_INPUT_ARMS for arm in a.arms):
+        lines += ["Direct entropy-input off/on/mean arms have identical parameter counts and initialized weights.",
+                  "Their centered Gaussian negative entropy is exactly -log(sigma/reference_sigma), fed causally into memory.",
+                  "The mean arm trains the on law and disables sampling at forecast; its mean path is not an exact nonlinear ensemble mean.", ""]
     (a.output / "summary.md").write_text("\n".join(lines))
     try:
         os.environ.setdefault("MPLCONFIGDIR", str(a.output / ".mpl-cache"))

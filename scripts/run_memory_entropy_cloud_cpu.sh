@@ -25,6 +25,12 @@ case "$mode" in
     "$python_bin" scripts/run_memory_entropy_cpu.py "${common[@]}" \
       --output "$output" --execution-label "$label"
     ;;
+  entropy)
+    "$python_bin" scripts/run_memory_entropy_cpu.py --seeds 0 1 2 --iterations 300 \
+      --width 16 --threads 2 --members 64 \
+      --arms memory_entropy_off memory_entropy_on memory_entropy_mean \
+      --output "$output" --execution-label "$label"
+    ;;
   controls)
     "$python_bin" scripts/run_memory_entropy_cpu.py "${common[@]}" --memory-strength 0 \
       --output "$output/no_physical_memory" --execution-label "$label"
@@ -34,7 +40,7 @@ case "$mode" in
       --output "$output/markov" --execution-label "$label"
     ;;
   *)
-    printf 'Usage: %s {smoke|study|controls}\n' "$0" >&2
+    printf 'Usage: %s {smoke|study|controls|entropy}\n' "$0" >&2
     exit 2
     ;;
 esac
