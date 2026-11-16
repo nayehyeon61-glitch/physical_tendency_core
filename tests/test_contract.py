@@ -1,71 +1,53 @@
-"""PG-Flow / KAI contract adapter: exact round trip and common-scale wind vectors."""
-
-import sys
-from pathlib import Path
-
 import numpy as np
-import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from gpclimate.contracts.pgflow_kai import CHANNEL_NAMES, KAIAdapter, kai_grid, kai_spec  # noqa: E402
+from pgcfm import contract
 
 
-def _stats():
+def test_channel_layout_matches_format_doc():
+    assert contract.N_CHANNELS == 67
+    assert contract.N_DYNAMIC == 66
+    expected = {"z50": 0, "z500": 6, "z1000": 11, "q50": 12, "t850": 33, "u50": 36,
+                "v1000": 59, "t2m": 60, "sp": 61, "tisr": 62, "tcwv": 63, "orog": 64,
+                "msl": 65, "skt": 66}
+    for name, i in expected.items():
+        assert contract.CHANNEL_INDEX[name] == i
+    assert contract.STATIC_CHANNELS == [64]
+    assert contract.level_slice("t") == slice(24, 36)
+    assert contract.REFERENCE_MEAN.shape == contract.REFERENCE_STD.shape == (67,)
+
+
+def test_grid_includes_poles_ascending():
+    assert contract.LATITUDES[0] == -90.0 and contract.LATITUDES[-1] == 90.0
+    assert np.allclose(np.diff(contract.LATITUDES), 1.5)
+    assert contract.LONGITUDES[-1] == 358.5
+
+
+def test_normalize_roundtrip_is_exact_with_eps():
     rng = np.random.default_rng(0)
-    mean = rng.normal(size=67)
-    std = rng.uniform(0.5, 3.0, size=67)
-    return mean, std
+    m, s = contract.REFERENCE_MEAN, contract.REFERENCE_STD
+    x = m[:, None, None] + s[:, None, None] * rng.standard_normal((67, 4, 5))
+    back = contract.denormalize(contract.normalize(x, m, s), m, s)
+    assert np.allclose(back, x, rtol=1e-12, atol=0)
 
 
-def test_channel_layout():
-    assert len(CHANNEL_NAMES) == 67
-    assert CHANNEL_NAMES[6] == "z500" and CHANNEL_NAMES[33] == "t850" and CHANNEL_NAMES[64] == "orog"
-    spec = kai_spec()
-    assert spec.n_v == 12 and spec.n_s == 41  # 66 dynamic = 41 scalars + 12 wind pairs (24) + tisr forcing
-    lat, lon = kai_grid()
-    assert lat[0] == -90 and lat[-1] == 90 and lon[-1] == 358.5
+def test_kai_style_denormalize_bias_on_small_std_channels():
+    """KAI inference denormalizes with `std` while training normalizes with
+    `std + 1e-8`. For q50/q100 that is a few-percent scale error on the
+    anomaly; for all other channels it is negligible."""
+    m, s = contract.REFERENCE_MEAN, contract.REFERENCE_STD
+    x = m[:, None, None] + 3.0 * s[:, None, None] * np.ones((67, 1, 1))
+    kai = contract.denormalize(contract.normalize(x, m, s), m, s, exact_inverse=False)
+    rel_anom_err = np.abs((kai - x)[:, 0, 0]) / (3.0 * s)
+    q50, q100 = contract.CHANNEL_INDEX["q50"], contract.CHANNEL_INDEX["q100"]
+    assert rel_anom_err[q50] > 0.02 and rel_anom_err[q100] > 0.01
+    others = [i for i in range(67) if i not in (q50, q100)]
+    assert rel_anom_err[others].max() < 1e-3
 
 
-def test_round_trip_exact():
-    mean, std = _stats()
-    ad = KAIAdapter(mean, std)
-    x = torch.randn(2, 67, 7, 12, dtype=torch.float64)
-    state, cond = ad.to_internal(x)
-    back = ad.to_kai(state, x)
-    assert torch.allclose(back, x, atol=1e-5)  # float32 internal state
-
-
-def test_wind_pair_uses_common_scale():
-    """Physical (u, v) rotate as a vector: |u + iv| of the internal channel is |wind| / one scale."""
-    mean, std = _stats()
-    ad = KAIAdapter(mean, std)
-    x = torch.randn(1, 67, 3, 4, dtype=torch.float64)
-    state, _ = ad.to_internal(x)
-    k = 6  # 500 hPa pair
-    iu, iv = CHANNEL_NAMES.index("u500"), CHANNEL_NAMES.index("v500")
-    u = x[0, iu] * (std[iu] + 1e-8) + mean[iu]
-    v = x[0, iv] * (std[iv] + 1e-8) + mean[iv]
-    speed = torch.sqrt(u ** 2 + v ** 2).flatten()
-    got = state.v[0, :, k].abs().double() * ad.vec_scale[k]
-    assert torch.allclose(got, speed, rtol=1e-5)
-
-
-def test_model_runs_on_kai_layout():
-    """Full KAI tensor layout (67 channels, 121x240 grid with poles) through the forecaster and back."""
-    from gpclimate.geometry.graphs import SphereGraphs
-    from gpclimate.models.dynamics_vnet import LieGuidedForecaster, VNetConfig
-    from gpclimate.models.lie_physical_gnn import GuideConfig
-
-    mean, std = _stats()
-    ad = KAIAdapter(mean, std)
-    lat, lon = kai_grid()
-    graphs = SphereGraphs(lat, lon, mesh_splits=(2, 1, 0))
-    model = LieGuidedForecaster(ad.spec, GuideConfig(cs=8, cv=4, depth=(1, 1, 1, 1, 1), hidden=16),
-                                VNetConfig(cs=8, cv=4, depth=(1, 1, 1, 1, 1), heads=2, ds=4, dv=2, hidden=16))
-    x = torch.randn(1, 67, len(lat), len(lon))
-    state, cond = ad.to_internal(x)
-    with torch.no_grad():
-        f, _ = model(state, cond, graphs.view())
-    out = ad.to_kai(f, x)
-    assert out.shape == x.shape and torch.isfinite(out).all()
+def test_below_ground_mask():
+    sp = np.array([[101000.0, 85000.0, 60000.0]])  # (lat=1, lon=3)
+    mask = contract.below_ground_mask(sp)  # (12, 1, 3)
+    lv = {p: i for i, p in enumerate(contract.LEVELS_HPA)}
+    assert not mask[:, 0, 0].any()
+    assert mask[lv[925], 0, 1] and mask[lv[1000], 0, 1] and not mask[lv[850], 0, 1]
+    assert mask[lv[700], 0, 2] and not mask[lv[600], 0, 2]

@@ -1,0 +1,232 @@
+# Tendency core ++: 확장 core 둘을 쓰는 모델 (2026-11-12)
+
+`docs/kai_tendency.md` 7.9절의 가장 좋은 모델은 **미세조정 KAI + 따로 학습한 core 둘(seed 0, 1)의 되먹임 연결**입니다. 1.5° + 버전(`docs/kai_tendency_plus_1p5_daily.md`)은 이 core를 5.625°의 크기 그대로(hidden 48, 259,842개) 격자점이 14배인 격자에 올렸고, 크기 실험(`scripts/run_kai_plus_arch.sh`, commit `aab72ef`)이 더 큰 core를 만들었습니다. **++ 버전은 이 확장 core 둘로 같은 two core 모델을 만드는 것**입니다. 실행은 `scripts/run_kai_plusplus.sh` 하나입니다.
+
+아직 실제 크기의 결과는 없습니다. CPU에서 작은 변형으로 모든 단계가 도는지만 확인했습니다(6절).
+
+## 1. + 버전과 ++ 버전
+
+| 항목 | + 버전 | ++ 버전 |
+| --- | --- | --- |
+| KAI | 7.57 M, 20,000 iteration + 미세조정 1,000 iteration | 같음 (같은 폴더의 `kai.pt`, `kai_ro.pt`를 그대로 씀) |
+| core의 구조 | 5.625°의 network: trunk 48, 기억 24채널, 259,842개 | 확장 core: 넓은 trunk 또는 다중 규모 trunk, 기억 48채널, 기억 입력의 2층 encoder |
+| core의 수 | 하나 (seed 0). seed twin은 크기 실험에서 학습 중 | **둘**: 확장 core(seed 0)와 그 seed twin(seed 1) |
+| 궤적 모델 | 미세조정 KAI + core 하나 되먹임 (`loop_core_plus@kai_ro`) | 미세조정 KAI + 확장 core 둘 되먹임 (`loop_A+B@kai_ro`) |
+| RMSE가 가장 작은 변형 | 선행일과 채널마다 섞는 혼합 (`blend_core_plus@kai_ro`) | 세 예보의 혼합 (`blend_A+B@kai_ro`) |
+| 물리항 G(x) 48개, ConvGRU 기억 8일, MZ loss, 하루 4 substep | 같음 | 같음 |
+
+core의 입력, loss, 학습 일정(6,000 iteration, batch 8), 자료는 + 버전과 같습니다. 바뀌는 것은 core의 network와 core의 수뿐입니다.
+
+## 2. 확장 core의 변형
+
+`ARCH`로 고릅니다. 크기 실험과 같은 이름, 같은 옵션이라서 크기 실험이 이미 학습한 core(`core_plus_w128.pt` 등)는 다시 학습하지 않고 그대로 씁니다.
+
+| `ARCH` | 구조 | parameter | core 둘 (KAI 7.57 M 대비) | 12 iteration + 검증 시간 |
+| --- | --- | --- | --- | --- |
+| (+ 버전) | trunk 48, 기억 24 | 259,842 | 0.52 M (+7 %) | 88 s |
+| `w96` | trunk 96, 기억 48, encoder 128 | 925,218 | 1.85 M (+24 %) | 114 s |
+| `w128` (기본) | trunk 128, 기억 48, encoder 128 | 1,435,394 | 2.87 M (+38 %) | 143 s |
+| `u64` | 다중 규모 trunk 64 / 128 / 192 (1.5 / 3 / 6°), 기억 48, encoder 128 | 2,883,522 | 5.77 M (+76 %) | 110 s |
+| `u96` | 다중 규모 trunk 96 / 160 / 224, 기억 48, encoder 128 | 4,330,530 | 8.66 M (+114 %) | 150 s |
+
+시간은 크기 실험을 돌린 쪽에서 GPU 한 장으로 잰 값입니다(commit `aab72ef`). + 버전의 core 학습이 6,000 iteration에 11.8시간이었으므로, 같은 비율이면 `w128`과 `u96`은 core 하나에 19~20시간쯤입니다(추정).
+
+기본을 `w128`로 둔 것은 크기 실험에서 지금 학습 중인 넓은 trunk이기 때문이고, 어느 변형이 더 좋은지는 아직 모릅니다. **크기 실험의 결과가 나오면 이긴 변형을 `ARCH`로 주면 됩니다.**
+
+## 3. 명령어 (GPU 서버)
+
++ 버전을 돌린 폴더(`runs/kaiplus_1p5_daily`, `data/era5_1p5_daily`)에서 그대로 돌립니다.
+
+```bash
+git pull
+# 기본: 넓은 core(w128)와 그 seed twin. 없는 것만 학습하고(끊기면 이어서), 끝나면 채점
+bash scripts/run_kai_plusplus.sh
+
+# 다중 규모 core로
+ARCH=u96 bash scripts/run_kai_plusplus.sh
+
+# seed twin 대신 서로 다른 확장 core 둘. 크기 실험이 둘 다 학습했으면 학습 없이 채점만 합니다
+ARCH=w128 ARCH2=u96 SC=pp_w128_u96 bash scripts/run_kai_plusplus.sh
+
+# GPU를 골라서 (크기 실험이 다른 GPU에서 도는 동안)
+CUDA_VISIBLE_DEVICES=1 bash scripts/run_kai_plusplus.sh
+
+# 학습은 다른 GPU에서 돌리고, 여기서는 checkpoint를 기다렸다가 채점만
+TRAIN=0 WAIT=1 bash scripts/run_kai_plusplus.sh
+
+# 명령만 출력
+DRYRUN=1 bash scripts/run_kai_plusplus.sh
+```
+
+- 학습하는 것: `core_plus_<ARCH>.pt`(seed 0)와 `core_plus_<ARCH>_s1.pt`(seed 1). 이미 있으면 건너뜁니다.
+- **같은 core를 두 곳에서 학습하지 않습니다.** 크기 실험이 `core_plus_w128`을 학습하는 중이면(같은 서버에 그 학습 process가 있거나, 폴더의 `core_plus_w128.part` 또는 `.log`가 최근 2시간 안에 바뀌었으면) ++ driver는 seed twin을 먼저 학습하고, 그다음 `core_plus_w128.pt`가 생기기를 기다립니다. 두 학습이 한 폴더에서 같은 이름으로 돌면 서로의 중간 저장을 덮어쓰기 때문입니다. 멈춘 학습을 기다리지 않고 여기서 바로 이으려면 `FORCE=1`을 줍니다.
+- 반대 방향의 확인은 없습니다. ++ driver가 학습하는 core(예: `core_plus_w128_s1`)를 다른 명령으로 동시에 시작하지 마세요.
+- GPU는 `CUDA_VISIBLE_DEVICES`로 고릅니다. 크기 실험과 같은 GPU에 올리면 메모리는 들어가도(변형 하나에 12.6~17.8 GB) 둘 다 느려집니다.
+- 폴더에 `core_plus_s1.pt`(+ 버전 core의 seed twin, 크기 실험의 `s1`)가 있으면 **+ 버전의 two core 모델**도 함께 채점해서 나란히 놓습니다.
+- 채점은 예보 파일을 디스크에 잠시 씁니다(core나 KAI 하나의 예보가 약 9 GB, 모두 60 GB 안팎).
+
+## 4. 채점에서 나오는 비교
+
+`score_pp.json`, `score_pp.log`(pairs 줄: 부트스트랩 95 % 구간), `breakdown_pp/breakdown_pp.txt`(정확한 정보 / 진폭 분해), `variable_table_pp.md`(변수별 표)에 아래 쌍이 나옵니다. A = 확장 core(seed 0), B = 둘째 core입니다.
+
+| 쌍 | 묻는 것 |
+| --- | --- |
+| `loop_A+B@kai_ro : kai_ro` | ++ 모델이 미세조정 KAI보다 얼마나 좋은가 |
+| `loop_A+B@kai_ro : loop_core_plus@kai_ro` | ++ 모델이 + 모델보다 얼마나 좋은가 |
+| `loop_A+B@kai_ro : loop_core_plus+core_plus_s1@kai_ro` | 같은 구조(core 둘)끼리: 확장 core의 몫만 (`core_plus_s1.pt`가 있을 때) |
+| `loop_A+B@kai_ro : loop_A@kai_ro` | 확장 core에서도 둘이 하나보다 좋은가 |
+| `loop_A@kai_ro : loop_core_plus@kai_ro`, `A : core_plus` | core 하나끼리: 확장 core 대 + core (되먹임, 단독) |
+| `loop_B@kai_ro : loop_A@kai_ro`, `B : A` | seed 차이의 크기 (변형이 넘어야 할 잡음) |
+| `blend_A+B@kai_ro : kai_ro`, `: kai`, `: blend_core_plus@kai_ro` | 혼합(RMSE가 가장 작은 변형)의 이득 |
+| `blend_A+B@kai_ro : blend_climatology@kai_ro` | 혼합이 미세조정 KAI를 기후값 쪽으로 줄인 것보다 좋은가 (단순 감쇠 대조) |
+| `blend_A+B@kai_ro : loop_A+B@kai_ro` | 혼합 대 되먹임 |
+
+## 5. 볼 것 (취약점 기준)
+
+1. **용량이 정말 모자랐는가.** + 버전의 core는 1.5°에서 단독으로 KAI보다 1일에 64.6 % 나빴습니다. 확장 core 단독(`A : core_plus`)이 이 차이를 얼마나 줄이는지가 첫 확인입니다.
+2. **seed 차이보다 큰가.** 5.625°에서 seed만 바꾼 차이는 0.1~0.4 %였습니다. `B : A`와 `loop_B : loop_A`가 1.5°의 잡음 크기이고, 확장의 이득은 이보다 커야 합니다.
+3. **이득이 정보인가 진폭인가.** + 버전에서 core 하나의 10일 이득 +3.5 % 가운데 정보는 +0.5 %였습니다. `breakdown_pp.txt`의 pattern(information) 줄과 ACC로 봅니다. 혼합은 단순 감쇠 대조(`blend_climatology`)보다 좋아야 core의 몫이라 할 수 있습니다.
+4. **둘의 이득이 앙상블인가 용량인가.** 5.625°에서 core 둘의 이득(+1.7 / +1.3 / +1.0 / +0.6 / 0.0 %)은 따로 학습한 두 core의 평균 효과였습니다. 확장 core는 이미 용량이 크므로 둘의 이득이 줄 수도 있습니다(`loop_A+B : loop_A`). **score Lr(2026-11-12 밤, `docs/kai_tendency.md` 7.10절)**: 5.625°에서 두 core와 parameter 수가 같은 넓은 core 하나가 core 둘의 연결을 모든 선행일에서 이겼습니다(+3.0 / +1.8 / +1.1 / +0.9 / +0.9 %, 유의한 칸 501 대 17). 크기의 효과(+4.6 / +3.1 / +2.1 / +1.4 / +1.0)가 평균의 효과(+1.7 / +1.3 / +1.0 / +0.6 / 0.0)보다 큽니다. 넓은 core 둘은 재지 않았으므로 평균의 효과가 큰 core에서도 남는지는 ++의 이 쌍이 처음으로 잽니다. GPU 시간이 한정되면 확장 core 하나가 먼저이고 seed twin은 그다음입니다(twin 하나에 19~20시간, 5.625°의 수로 본 기대 이득은 선행 1~5일에 +1 ~ +2 %).
+5. **공정성.** ++ 모델은 KAI에 parameter를 24~114 % 더합니다(+ 버전 core 하나는 3.4 %). 같은 크기의 KAI는 학습하지 않았으므로, "같은 parameter에서 더 좋다"는 말은 아직 할 수 없습니다.
+6. **loss 가중.** sp, skt, z50의 큰 이득은 일부가 KAI와 core의 loss 가중 차이에서 옵니다(+ 문서 8.5절). ++에서도 그대로입니다.
+
+## 6. 시험 상태
+
+- **CPU 작은 시험: 통과** (2026-11-12 19:40~20:29 KST, `SMOKE=1`, 24일 자료, 작은 KAI, 작은 변형: trunk 24, 기억 12채널, encoder 24, 2 iteration). 확장 core 둘(seed 0, 1)의 학습, 채점(예보 34종, 쌍 19개와 부트스트랩 구간), 정보 / 진폭 분해(쌍 16개), 변수별 표까지 한 번에 끝났습니다. 폴더에 `core_plus_s1.pt`가 있어서 + 버전의 two core 모델과 단순 감쇠 대조도 함께 채점됐습니다. seed twin은 첫 core와 다른 예보를 냈습니다(seed가 적용됨).
+- 이 시험의 수치에는 의미가 없습니다. 2 iteration만 학습한 core는 persistence와 거의 같습니다. 도는지만 본 것입니다.
+- 같은 core를 두 번 학습하지 않는 확인(3절)은 학습을 흉내 낸 가짜 실행으로 일곱 경우를 시험했습니다: 아무것도 없을 때, 다른 곳에서 학습 중(중간 저장이 최근 것), 멈춘 학습(3시간 전), 같은 서버의 process, `FORCE=1`, 둘 다 학습 중, `ARCH2`.
+- ++ driver로 돌려 본 변형은 넓은 trunk(`w*`)뿐입니다. 다중 규모 trunk(`u*`)는 같은 옵션을 크기 실험 쪽에서 GPU로 학습하고 있지만, ++ driver를 거친 작은 시험은 하지 않았습니다.
+- **core +가 없는 새 폴더(7절의 `CORE=0`, `PLUS=0`): CPU 작은 시험 통과** (2026-11-13 12:33~12:51 KST, `SMOKE=1`, 빈 폴더에서 시작). + driver가 KAI와 미세조정 KAI만 만들고 멈췄고, ++ driver가 그 폴더에서 확장 core 둘을 학습한 뒤 채점(쌍 16개와 부트스트랩 구간), 정보 / 진폭 분해(쌍 13개), 변수별 표까지 끝냈습니다. 학습 연도 확인도 시험했습니다: 연도를 주지 않으면 폴더의 `kai.pt`에서 읽고, 다른 연도를 주면 학습 전에 멈춥니다. 이 시험은 학습 연도가 하나(2015년)였고, 32년 자료와 48,000 iteration의 일정은 돌려 보지 않았습니다.
+- 실제 크기(1.5°, GPU)에서는 아직 돌리지 않았습니다. 학습 시간(2절)과 디스크(3절)는 추정입니다.
+
+## 7. 원래의 학습 기간(1980~2011년, 32년)으로 KAI, ++ core, 혼합까지 (2026-11-13)
+
+지금까지의 1.5° 결과는 모두 2012~2015년 4년으로 학습한 것입니다. 원본 KAI checkpoint의 학습 기간인 1980~2011년 32년으로 KAI, 미세조정 KAI, 확장 core 둘, 혼합까지 다시 만드는 명령입니다. 정규화 통계와 기후값(`stats.npz`)이 학습 연도로 정해지므로 **새 폴더**(`runs/kaiplus_1p5_daily_32y`)에서 돌립니다. 4년 실행의 폴더는 건드리지 않습니다.
+
+### 7.1 명령어
+
+```bash
+cd physical_guide_flowmatching
+git pull --ff-only origin claude/project-thread-wjjayb
+
+# 0. 일평균 자료에 1980년이 같은 모양으로 있는지 확인 (몇 초, NOT OK나 WARNING이 나오면 멈추고 출력을 보내 주세요)
+python scripts/local_era5_to_kai.py --src /lustre/home/mahmed/ERA5_0p25_DAILY --src-daily --check \
+    --years 1980 --grid 1.5 --out data/era5_1p5_daily
+
+# 1. 전체: 자료 변환(1980~2011), KAI, 미세조정 KAI, 확장 core 둘(w128, seed 0과 1), 채점(혼합 포함)
+export OUT=runs/kaiplus_1p5_daily_32y
+mkdir -p $OUT
+nohup bash -c 'SRC=daily CORE=0 TRAIN_YEARS="$(seq -s " " 1980 2011)" KAI_ITERS=160000 bash scripts/run_kai_plus.sh \
+    && PLUS=0 CORE_ITERS=48000 bash scripts/run_kai_plusplus.sh' > $OUT/driver.out 2>&1 &
+
+# 진행 보기
+tail -f $OUT/driver.out          # 지금 어느 단계인지
+tail -n 3 $OUT/kai.log           # 500 iteration마다 한 줄: loss, val, sec(누적 초), gpu_gb
+```
+
+- 첫 줄(`CORE=0`)은 + driver의 1~3단계만 합니다: 자료 변환, KAI, 미세조정 KAI. 4년 실행의 core +(259,842개)는 이 폴더에서 학습하지 않습니다.
+- 둘째 줄(`PLUS=0`)은 core +가 없는 폴더에서 확장 core 둘을 학습하고 채점합니다. 학습 연도는 폴더의 `kai.pt`에서 읽으므로 따로 주지 않아도 되고, 다른 연도를 주면 학습 전에 멈춥니다.
+- **혼합은 따로 학습하는 단계가 없습니다.** 채점 단계가 검증 연도(2016년)의 예보로 선행일과 채널마다 섞는 비율을 정하고 시험 연도(2017년)에서 평가합니다. `score_pp.log`의 `blend_core_plus_w128+core_plus_w128_s1@kai_ro`가 ++ 혼합이고, `loop_...@kai_ro`가 ++ 되먹임 모델입니다.
+- 검증 연도 2016, 시험 연도 2017은 4년 실행과 같게 두었습니다. 두 해 모두 학습 기간 밖이고, 4년 실행의 수치와 같은 초기장으로 바로 비교됩니다.
+- 끊기면 같은 명령을 다시 실행합니다. 끝난 단계는 건너뛰고 학습은 마지막 기록 지점에서 이어집니다.
+- 다른 변형은 둘째 줄에 `ARCH=u96`처럼 줍니다(2절).
+
+GPU가 하나 더 있으면, 첫 명령이 확장 core의 학습을 시작한 뒤(`$OUT/core_plus_w128.log`가 생긴 뒤)에 다른 GPU에서 seed twin을 같이 돌릴 수 있습니다. `CORE_ITERS`는 첫 명령과 같아야 합니다.
+
+```bash
+SCORE=0 PLUS=0 CORE_ITERS=48000 OUT=runs/kaiplus_1p5_daily_32y CUDA_VISIBLE_DEVICES=1 \
+    nohup bash scripts/run_kai_plusplus.sh > runs/kaiplus_1p5_daily_32y/driver_twin.out 2>&1 &
+```
+
+이 명령은 seed twin만 학습하고 끝납니다(3절의 확인이 첫 core를 건너뜁니다). 첫 명령은 twin의 checkpoint를 기다렸다가 채점합니다.
+
+### 7.2 iteration 수와 예상 시간
+
+iteration 수는 **4년 실행과 자료를 도는 횟수(epoch)가 같도록** 8배로 잡았습니다. 학습률의 cosine 일정이 처음에 준 iteration 수로 정해지므로 도중에 늘릴 수 없습니다. 시작 전에 정해야 합니다.
+
+| 단계 | 4년 실행 | 32년 (같은 epoch) | 예상 시간 (L40S 한 장) |
+| --- | --- | --- | --- |
+| 자료 변환 | 6년에 53분 | 32년 | 약 5시간 |
+| KAI (batch 8) | 20,000 (약 110 epoch) | `KAI_ITERS=160000` | 1.09초 × 160,000 = 약 2.0일 |
+| 미세조정 KAI | 1,000 | 1,000 (그대로) | 0.35시간 |
+| 확장 core `w128` 하나 (batch 8) | 6,000 (약 33 epoch) | `CORE_ITERS=48000` | 약 11.5초 × 48,000 = 약 6.4일 |
+| seed twin | 6,000 | 48,000 | 약 6.4일 (다른 GPU면 겹침) |
+| 채점, 분해, 표 | 36분 (core 하나) | 시험 연도가 같아서 자료 크기와 무관 | 1~2시간 |
+
+GPU 한 장으로 차례로 돌리면 약 15일, core 둘을 GPU 두 장에 나누면 약 9일입니다. 모두 4년 실행에서 잰 iteration당 시간으로 계산한 **추정**이고, 32년 자료로는 재지 않았습니다.
+
+줄이는 방법:
+
+- `CORE_ITERS=24000`: core 하나에 약 3.2일(약 16 epoch). 4년 실행의 core +는 6,000 가운데 4,500 iteration 이후로 검증 loss가 내려가지 않았지만, 자료가 8배이고 core가 커진 경우에도 그런지는 모릅니다.
+- `KAI_ITERS=80000`: KAI 약 1일(약 55 epoch).
+- 미세조정은 1,000 iteration 그대로 두었습니다. KAI를 자기 rollout에 맞추는 짧은 조정이라 epoch에 맞춰 늘리지 않았습니다(판단이고, 시험하지 않았습니다).
+
+### 7.3 주의할 점 (취약점 기준)
+
+1. **이 크기로 돌려 본 적이 없습니다.** 새 옵션(`CORE=0`, `PLUS=0`)은 CPU의 작은 시험으로만 확인했습니다(6절). 32년 자료(1.5° 일평균, 한 해 2.84 GB, 모두 약 91 GB)는 메모리에 올리지 않고 디스크에서 배치마다 읽습니다. 4년(11 GB)은 운영체제가 모두 캐시했지만 91 GB는 서버의 메모리에 따라 디스크 읽기가 학습을 늦출 수 있습니다. **`kai.log`의 첫 줄(500 iteration)의 `sec`가 550 안팎이면 4년 실행과 같은 속도**이고, 훨씬 크면 읽기가 병목입니다.
+2. **통계 계산.** KAI 학습이 시작되기 전에 32년 자료를 세 번 읽어 평균, 표준편차, 일 증분, 기후값을 만듭니다(`stats.npz`). 그동안 `kai.log`에는 아무것도 찍히지 않습니다. 걸리는 시간은 재지 않았습니다.
+3. **디스크.** 변환한 자료 약 91 GB(`data/era5_1p5_daily/kaiday`), `stats.npz` 2.7 GB, 채점 중 임시 파일 60 GB 안팎이 필요합니다.
+4. **여전히 원본 checkpoint는 아닙니다.** 여기서 학습하는 KAI는 원본과 같은 코드, 같은 기간이지만 우리의 학습 방식(batch 8, 약 110 epoch, 0.25° 일평균을 1.5°로 내린 자료)으로 다시 학습한 것입니다. 원본 설정은 batch 32, 150 epoch입니다. 원본 방식에 맞추려면 `KAI_BATCH=32 KAI_ITERS=54800`을 줍니다(GPU 메모리는 batch 8의 9.1 GB에서 비례로 약 36 GB, 시간 약 2.8일: 추정이고 돌려 보지 않았습니다).
+5. **+ 버전과의 비교가 없습니다.** 이 폴더에는 core +가 없으므로 채점은 KAI, 미세조정 KAI, 확장 core 하나, 둘의 비교입니다. 32년에서 "확장 core 대 core +"를 보려면 core +도 48,000 iteration(약 3.9일)을 학습해야 합니다.
+6. **core 하나가 먼저입니다.** score Lr(5절 4번)에 따르면 이득의 큰 몫은 확장 core 하나에서 옵니다. seed twin의 6.4일은 `loop_A+B : loop_A`의 차이만큼만 더합니다.
+
+### 7.4 PLUS=0일 때 채점에 나오는 쌍
+
+| 쌍 | 묻는 것 |
+| --- | --- |
+| `loop_A+B@kai_ro : kai_ro`, `: kai` | ++ 되먹임 모델이 미세조정 KAI, KAI보다 얼마나 좋은가 |
+| `loop_A@kai_ro : kai_ro` | 확장 core 하나의 몫 |
+| `loop_A+B@kai_ro : loop_A@kai_ro` | 둘이 하나보다 좋은가 |
+| `loop_B@kai_ro : loop_A@kai_ro`, `B : A` | seed 차이의 크기 |
+| `A : kai` | 확장 core 단독 대 KAI |
+| `kai_ro : kai` | 미세조정만의 몫 |
+| `blend_A+B@kai_ro : kai_ro`, `: kai` | ++ 혼합의 이득 |
+| `blend_A+B@kai_ro : blend_A@kai_ro`, `blend_A@kai_ro : kai_ro` | 혼합에서 core 둘 대 하나, core 하나 혼합의 이득 |
+| `blend_A+B@kai_ro : blend_climatology@kai_ro` | 혼합이 단순 감쇠보다 좋은가 |
+| `blend_A+B@kai_ro : loop_A+B@kai_ro` | 혼합 대 되먹임 |
+
+## 8. 시간 확장 설정 (2026-11-14)
+
+요청(2026-11-14 16:09 KST): "기간에 대한 적응, 즉 장기간 학습에 대한 효과를 올릴 필요가 있으면 ++ 위에 시간 적응에 대한 구조를 올려 주세요." 5.625° 시험(`docs/kai_time_extension.md`)에서 잰 결과에 따라 두 가지를 driver에 넣었습니다. 최근 연도에 가중치를 맞추는 적응 단계는 넣지 않았습니다(KAI에서 두 번 재서 두 번 다 3일부터 손해였고, 평균 상태만 맞추는 구조의 상한이 총 +0.1 ~ +0.2 %였기 때문입니다).
+
+| 설정 | 기본값 | 하는 일 | 근거 |
+|---|---|---|---|
+| `TIME=1` | 켜짐 | 학습 연도가 4년보다 많고 반복 수를 직접 주지 않았으면 `KAI_ITERS`, `CORE_ITERS`를 연도 / 4배로 늘림(4년 실행과 같은 epoch 수). `run_kai_plus.sh`와 `run_kai_plusplus.sh` 모두 | 연도만 8배: KAI +0.3 ~ +0.9 %. 반복 수도 8배: 4년에 같은 반복 수를 쓴 것보다 +1.3 ~ +2.5 % |
+| `GAP=1` | 켜짐 | 채점 뒤에 3단계로 과적합 폭을 잼: KAI, 미세조정 KAI, 확장 core 둘의 하루 loss(와 자기 적분 3일의 loss)를 학습 기간의 첫 해 / 가운데 해 / 마지막 해와 검증 / 시험 연도에서 비교. 결과 `diag_gap_pp.json`, 화면에 `[++] gap` 줄 | 폭이 2 %인 모델은 연도를 늘려도 그대로였고, 6.8 %인 모델은 연도에서 이득을 얻었음 |
+
+- 32년 명령(7.1절)은 이제 `KAI_ITERS=160000`과 `CORE_ITERS=48000`을 빼도 같은 값이 됩니다(20000 × 8, 6000 × 8). 직접 준 값이 있으면 그 값이 우선이고, `TIME=0`이면 4년 실행의 반복 수 그대로입니다. 4년 폴더에서는 아무것도 달라지지 않습니다.
+- `GAP`의 읽는 법: 하루 loss의 "처음 보는 해 / 학습한 해 − 1"이 3 % 아래면 용량이나 반복 수가 모자란 것이라 연도를 더 늘려도 그만큼이 상한이고, `ARCH`를 키우거나 반복 수를 늘릴 차례입니다. 5 % 위면 자료가 모자란 것이라 연도가 이득을 줍니다. 이 경계는 5.625° 시험의 두 점에서 잡은 것이고, 해마다 난이도가 1 ~ 2 % 다르므로 한두 해가 아니라 여러 해로 봐야 합니다(`GAP_YEARS="1985 1995 2005 2011 2016 2017"`처럼 직접 줄 수 있고, `GAP_DAYS`는 해마다 쓰는 날 수, 기본 30).
+- 따로 돌릴 때: `python scripts/kai_gap_diag.py --out <폴더> --data ... --cache ... --era5 ... --depths ... --dims ... --device cuda --kai kai kai_ro --cores core_plus_w128 --years ... --days 30 --gap-leads 3`.
+- 시험: dry run(32년에서 KAI 160000, core + 24000, 확장 core 48000이 나오는 것, 4년에서 그대로인 것), 1.5° smoke 폴더에서 3단계 실행(CPU, 3분), 5.625°에서 고친 진단이 이전 숫자를 그대로 내는 것(32년 KAI 2015년 0.1785, 2016년 0.1840). GPU에서는 돌려 보지 못했습니다.
+
+## 9. 1.5° GPU 실행 결과 (학습 2012~2015): KAI, 미세조정 KAI, 가장 좋은 혼합 모델 (2026-11-13)
+
+`ARCH=u64`(다중 규모 U-Net core, seed 0과 1)로 학습과 채점을 마쳤습니다(11-12 20:46 ~ 11-13 22:20, GPU 하나, core 하나에 약 12시간). 아래 그림은 세 모델만 놓고 봅니다: 원본 KAI(`kai`), 미세조정 KAI(`kai_ro`), RMSE가 가장 작은 혼합 모델(`blend_core_plus_u64+core_plus_u64_s1@kai_ro`: 미세조정 KAI와 U-Net core 둘의 혼합). 2017년 초기장 119개, 일평균 1.5°, 이득은 모두 + = 좋아짐입니다.
+
+```bash
+python scripts/plot_kai_pp_compare.py runs/kaiplus_1p5_daily docs/kai_tendency_plusplus_1p5_daily/figures
+```
+
+![변수별 RMSE](kai_tendency_plusplus_1p5_daily/figures/cmp1_rmse_by_variable.png)
+
+![선행 시간별 skill](kai_tendency_plusplus_1p5_daily/figures/cmp2_skill_vs_lead.png)
+
+![주요 변수 heatmap](kai_tendency_plusplus_1p5_daily/figures/cmp3_heatmap_headline.png)
+
+![모든 변수 x 고도 x 선행 heatmap](kai_tendency_plusplus_1p5_daily/figures/cmp4_heatmap_all.png)
+
+![변수 묶음별 heatmap](kai_tendency_plusplus_1p5_daily/figures/cmp5_heatmap_by_group.png)
+
+65채널 nRMSE 이득(%, 선행 1 / 3 / 5 / 7 / 10일):
+
+| 비교 | 1일 | 3일 | 5일 | 7일 | 10일 |
+| --- | --- | --- | --- | --- | --- |
+| 미세조정 KAI : KAI | -1.0 | +1.9 | +2.8 | +2.9 | +3.1 |
+| 혼합 : KAI | +3.5 | +6.1 | +9.8 | +13.2 | +15.9 |
+| 혼합 : 미세조정 KAI | +4.5 | +4.2 | +7.2 | +10.6 | +13.2 |
+| 혼합 : 미세조정 KAI를 기후값으로 감쇠 | +4.5 | +3.3 | +3.4 | +2.1 | -2.4 |
+
+- 혼합 모델은 KAI와 미세조정 KAI 둘 다에 대해 변수 x 고도 x 선행 650칸 가운데 유의하게 나쁜 칸이 없습니다(KAI 대비 648칸, 미세조정 KAI 대비 650칸 모두 유의하게 좋음).
+- 미세조정만으로는 1일에 조금 나빠지고(-1.0 %) 3일부터 +2~3 %입니다.
+- 이득이 가장 큰 곳은 sp(+38~53 %), skt(+18~23 %), 1~2일의 z50 / z100입니다. sp와 skt의 이득 일부는 loss 가중 차이에서 옵니다(5절 6번).
+- **뒤쪽 선행의 이득은 대부분 감쇠입니다.** 미세조정 KAI를 기후값 쪽으로 줄이기만 한 대조와 비교하면 혼합의 이득은 1~7일에 +2~4.5 %이고, 9일부터는 대조가 더 좋습니다(10일 -2.4 %). 10일의 +13~16 %를 core의 정보로 읽으면 안 됩니다.
