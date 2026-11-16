@@ -1,0 +1,7 @@
+# Small, synthetic CPU experiment; no ERA5, CUDA, KAI or full requirements.txt needed.
+# Use Python >=3.11. The result JSON records the exact installed versions.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.15.0+cpu
+numpy>=1.26,<3
+matplotlib>=3.8,<4
+pytest>=8,<10
